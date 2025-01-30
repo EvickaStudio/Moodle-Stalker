@@ -1,95 +1,105 @@
+import argparse
 import logging
+import sys
+import time
 
-from src.moodle import MoodleNotificationHandler
-from src.notification import (
-    NotificationProcessor,
-    NotificationSender,
-    NotificationSummarizer,
-)
-from src.ui import animate_logo, clear_screen, logo_lines, setup_logging
-from src.utils import Config
-
-
-def get_int_config(
-    config: Config, section: str, option: str, default: int
-) -> int:
-    """
-    Retrieves an integer value from the configuration.
-    If the value is missing or invalid, returns the default.
-    """
-    value = config.get_config(section, option)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        logging.warning(
-            f"Invalid or missing integer for [{section}] {option}, using default {default}."
-        )
-        return default
+from src.core.config.generator import ConfigGenerator
+from src.core.config.loader import Config
+from src.core.notification.processor import NotificationProcessor
+from src.core.service_locator import ServiceLocator
+from src.core.services import initialize_services
+from src.core.utils.retry import with_retry
+from src.infrastructure.logging.setup import setup_logging
+from src.services.moodle.notification_handler import MoodleNotificationHandler
+from src.ui.cli.screen import animate_logo, logo_lines
 
 
-def get_str_config(
-    config: Config, section: str, option: str, default: str
-) -> str:
-    """
-    Retrieves a string value from the configuration.
-    If the value is missing, returns the default.
-    """
-    value = config.get_config(section, option)
-    if value is None:
-        logging.warning(
-            f"Missing string for [{section}] {option}, using default '{default}'."
-        )
-        return default
-    return value
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Moodle Mate - Your Smart Moodle Notification Assistant"
+    )
+    parser.add_argument(
+        "--gen-config", action="store_true", help="Generate a new configuration file"
+    )
+    parser.add_argument("--config", default="config.ini", help="Path to config file")
+    return parser.parse_args()
+
+
+@with_retry(max_retries=3, base_delay=5.0, max_delay=30.0)
+def fetch_and_process(moodle_handler, notification_processor):
+    """Fetch and process notifications with retry logic."""
+    if notification := moodle_handler.fetch_newest_notification():
+        notification_processor.process(notification)
+    return True
 
 
 def main() -> None:
+    """Main entry point of the application."""
+    setup_logging()
+    args = parse_args()
+
+    if args.gen_config:
+        generator = ConfigGenerator()
+        if generator.generate_config():
+            logging.info("Configuration file generated successfully!")
+            sys.exit(0)
+        else:
+            logging.error("Failed to generate configuration file.")
+            sys.exit(1)
+
+    animate_logo(logo_lines)
+    logging.info("Starting Moodle Mate...")
+
     try:
-        # Clear the screen and print the logo
-        clear_screen()
-        animate_logo(logo_lines)
+        # Initialize all services
+        initialize_services()
 
-        # Set up logging
-        setup_logging()
-
-        # Initialize Config object
-        config = Config("config.ini")
-
-        # Read configurations with error handling
-        sleep_duration_seconds: int = get_int_config(
-            config, "settings", "FETCH_INTERVAL", 60
+        # Get required services from locator
+        locator = ServiceLocator()
+        config = locator.get("config", Config)
+        notification_processor = locator.get(
+            "notification_processor", NotificationProcessor
         )
-        max_retries: int = get_int_config(config, "settings", "MAX_RETRIES", 3)
-        summary: int = get_int_config(config, "summary", "SUMMARIZE", 0)
-        bot_name: str = get_str_config(
-            config, "discord", "BOT_NAME", "Moodle Mate"
-        )
-        thumbnail: str = get_str_config(
-            config,
-            "discord",
-            "THUMBNAIL_URL",
-            "https://raw.githubusercontent.com/EvickaStudio/Moodle-Mate/main/assets/logo.png",
-        )
+        moodle_handler = locator.get("moodle_handler", MoodleNotificationHandler)
 
-        # Initialize other classes with the Config object
-        moodle_handler = MoodleNotificationHandler(config)
-        summarizer = NotificationSummarizer(config)
-        sender = NotificationSender(config, bot_name, thumbnail)
+        consecutive_errors = 0
+        # Main loop
+        while True:
+            try:
+                success = fetch_and_process(moodle_handler, notification_processor)
+                if success:
+                    consecutive_errors = 0  # Reset error counter on success
 
-        # Start the notification processor
-        processor = NotificationProcessor(
-            handler=moodle_handler,
-            summarizer=summarizer,
-            sender=sender,
-            summary_setting=summary,
-            sleep_duration=sleep_duration_seconds,
-            max_retries=max_retries,
-        )
-        processor.run()
+                # Adaptive sleep based on error state
+                sleep_time = config.notification.fetch_interval
+                if consecutive_errors > 0:
+                    # Increase sleep time when experiencing errors
+                    sleep_time = min(sleep_time * (2**consecutive_errors), 300)
+                time.sleep(sleep_time)
 
+            except Exception as e:
+                consecutive_errors += 1
+                logging.error(
+                    f"Error during execution (attempt {consecutive_errors}): {str(e)}"
+                )
+
+                if consecutive_errors >= config.notification.max_retries:
+                    logging.critical(
+                        "Too many consecutive errors. Restarting main loop..."
+                    )
+                    consecutive_errors = 0  # Reset counter and continue
+
+                # Exponential backoff sleep on error
+                error_sleep = min(30 * (2 ** (consecutive_errors - 1)), 300)
+                logging.info(f"Waiting {error_sleep} seconds before retry...")
+                time.sleep(error_sleep)
+
+    except KeyboardInterrupt:
+        logging.info("Shutting down gracefully...")
     except Exception as e:
-        logging.exception(f"An unexpected error occurred during execution: {e}")
-        exit(1)
+        logging.error(f"An unexpected error occurred: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":

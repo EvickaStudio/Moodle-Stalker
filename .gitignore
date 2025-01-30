@@ -15,7 +15,7 @@ old/
 release/
 .vscode/
 thread.ini
-tests/
+test/
 log.txt
 help.py
 
@@ -173,7 +173,7 @@ cython_debug/
 #.idea/
 
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
